@@ -156,96 +156,140 @@ func parseObjects(s string) []map[string]any {
 // parseToolCalls attempts to parse a JSON string into a slice of ToolCalls.
 // mxyng: this only really works if the input contains tool calls in some JSON format
 func (m *Model) parseToolCalls(s string) ([]api.ToolCall, bool) {
-	// create a subtree from the node that ranges over .ToolCalls
-	tmpl := m.Template.Subtree(func(n parse.Node) bool {
-		if t, ok := n.(*parse.RangeNode); ok {
-			return slices.Contains(template.Identifiers(t.Pipe), "ToolCalls")
-		}
+    // Sanitize JSON quotes first
+    sanitized := replaceJSONQuotes(s)
 
-		return false
-	})
+    // Original template detection logic
+    tmpl := m.Template.Subtree(func(n parse.Node) bool {
+        if t, ok := n.(*parse.RangeNode); ok {
+            return slices.Contains(template.Identifiers(t.Pipe), "ToolCalls")
+        }
+        return false
+    })
 
-	if tmpl == nil {
-		return nil, false
-	}
+    if tmpl == nil {
+        return nil, false
+    }
 
-	var b bytes.Buffer
-	if err := tmpl.Execute(&b, map[string][]api.ToolCall{
-		"ToolCalls": {
-			{
-				Function: api.ToolCallFunction{
-					Name: "@@name@@",
-					Arguments: api.ToolCallFunctionArguments{
-						"@@argument@@": 1,
-					},
-				},
-			},
-		},
-	}); err != nil {
-		return nil, false
-	}
+    // Execute template to find key names
+    var b bytes.Buffer
+    if err := tmpl.Execute(&b, map[string][]api.ToolCall{
+        "ToolCalls": {{
+            Function: api.ToolCallFunction{
+                Name: "@@name@@",
+                Arguments: api.ToolCallFunctionArguments{
+                    "@@argument@@": 1,
+                },
+            },
+        }},
+    }); err != nil {
+        return nil, false
+    }
 
-	templateObjects := parseObjects(b.String())
-	if len(templateObjects) == 0 {
-		return nil, false
-	}
+    templateObjects := parseObjects(b.String())
+    if len(templateObjects) == 0 {
+        return nil, false
+    }
 
-	// find the keys that correspond to the name and arguments fields
-	var name, arguments string
-	for k, v := range templateObjects[0] {
-		switch v.(type) {
-		case string:
-			name = k
-		case map[string]any:
-			arguments = k
-		}
-	}
+    // Detect name/arguments keys
+    var nameKey, argsKey string
+    for k, v := range templateObjects[0] {
+        switch v.(type) {
+        case string:
+            nameKey = k
+        case map[string]any:
+            argsKey = k
+        }
+    }
 
-	if name == "" || arguments == "" {
-		return nil, false
-	}
+    if nameKey == "" || argsKey == "" {
+        return nil, false
+    }
 
-	responseObjects := parseObjects(s)
-	if len(responseObjects) == 0 {
-		return nil, false
-	}
+    // Parse the sanitized response
+    responseObjects := parseObjects(sanitized)
+    if len(responseObjects) == 0 {
+        return nil, false
+    }
 
-	// collect all nested objects
-	var collect func(any) []map[string]any
-	collect = func(obj any) (all []map[string]any) {
-		switch o := obj.(type) {
-		case map[string]any:
-			all = append(all, o)
-			for _, v := range o {
-				all = append(all, collect(v)...)
-			}
-		case []any:
-			for _, v := range o {
-				all = append(all, collect(v)...)
-			}
-		}
+    // Collect nested objects
+    var collect func(any) []map[string]any
+    collect = func(obj any) (all []map[string]any) {
+        switch o := obj.(type) {
+        case map[string]any:
+            all = append(all, o)
+            for _, v := range o {
+                all = append(all, collect(v)...)
+            }
+        case []any:
+            for _, v := range o {
+                all = append(all, collect(v)...)
+            }
+        }
+        return
+    }
 
-		return all
-	}
+    var objs []map[string]any
+    for _, p := range responseObjects {
+        objs = append(objs, collect(p)...)
+    }
 
-	var objs []map[string]any
-	for _, p := range responseObjects {
-		objs = append(objs, collect(p)...)
-	}
+    var toolCalls []api.ToolCall
+    for _, kv := range objs {
+        // Try standard fields first
+        name, _ := kv[nameKey].(string)
+        args, _ := kv[argsKey].(map[string]any)
 
-	var toolCalls []api.ToolCall
-	for _, kv := range objs {
-		n, nok := kv[name].(string)
-		a, aok := kv[arguments].(map[string]any)
-		if nok && aok {
-			toolCalls = append(toolCalls, api.ToolCall{
-				Function: api.ToolCallFunction{
-					Name:      n,
-					Arguments: a,
-				},
-			})
-		}
-	}
+        // Fallback to model-specific fields
+        if name == "" {
+            name, _ = kv["tool_name"].(string)
+        }
+        if len(args) == 0 {
+            args, _ = kv["tool_arguments"].(map[string]any)
+        }
 
-	return toolCalls, len(toolCalls) > 0
+        if name != "" && len(args) > 0 {
+            toolCalls = append(toolCalls, api.ToolCall{
+                Function: api.ToolCallFunction{
+                    Name:      name,
+                    Arguments: args,
+                },
+            })
+        }
+    }
+
+    return toolCalls, len(toolCalls) > 0
+}
+
+// Helper function for safe quote replacement
+func replaceJSONQuotes(s string) string {
+    var buf strings.Builder
+    stack := 0
+    inString := false
+    escape := false
+
+    for _, r := range s {
+        switch {
+        case !escape && r == '\\':
+            escape = true
+        case !escape && r == '"':
+            inString = !inString
+        case !escape && r == '{' && !inString:
+            stack++
+        case !escape && r == '}' && !inString:
+            stack--
+        }
+
+        // Replace single quotes only in JSON structures
+        if stack > 0 && !inString && r == '\'' {
+            buf.WriteRune('"')
+        } else {
+            buf.WriteRune(r)
+        }
+
+        if escape {
+            escape = false
+        }
+    }
+    return buf.String()
 }
