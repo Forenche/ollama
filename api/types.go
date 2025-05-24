@@ -152,25 +152,6 @@ type ToolCallFunction struct {
 	Index     int                       `json:"index,omitempty"`
 	Name      string                    `json:"name"`
 	Arguments ToolCallFunctionArguments `json:"arguments"`
-	ToolName	string					`json:"tool_name,omitempty"`
-	ToolArguments	ToolCallFunctionArguments `json:"tool_arguments,omitempty"`
-}
-
-func (f *ToolCallFunction) UnmarshalJSON(data []byte) error {
-    type Alias ToolCallFunction
-    aux := struct{ *Alias }{Alias: (*Alias)(f)}
-    if err := json.Unmarshal(data, &aux); err != nil {
-        return err
-    }
-
-    // Add fallback population without altering original logic
-    if f.Name == "" && f.ToolName != "" {
-        f.Name = f.ToolName
-    }
-    if len(f.Arguments) == 0 && len(f.ToolArguments) > 0 {
-        f.Arguments = f.ToolArguments
-    }
-    return nil
 }
 
 type ToolCallFunctionArguments map[string]any
